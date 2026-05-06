@@ -152,7 +152,7 @@ const loadDbFromSession = (SQL) => {
     if (!cached) return null;
     const binary = atob(cached);
     const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    for (let byteIndex = 0; byteIndex < binary.length; byteIndex++) bytes[byteIndex] = binary.charCodeAt(byteIndex);
     return new SQL.Database(bytes);
   } catch (e) {
     console.warn('Failed to restore DB from sessionStorage', e);
