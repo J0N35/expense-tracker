@@ -1,4 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import {
+  getCategoryLabel,
+  getCategoryOptions,
+  getCanonicalCategoryValue,
+  getDefaultCategoryValue,
+} from './config/categories';
 // i18n dictionary
 const translations = {
   zh: {
@@ -213,7 +219,7 @@ const App = () => {
   // Form State
   const [formData, setFormData] = useState({
     amount: '',
-    category: lang === 'zh' ? '餐飲' : 'Food',
+    category: getDefaultCategoryValue(),
     date: new Date().toISOString().split('T')[0],
     note: '',
     type: 'expense',
@@ -366,7 +372,7 @@ const App = () => {
     }
     setFormData({
       amount: record.amount,
-      category: record.category,
+      category: getCanonicalCategoryValue(record.category),
       date: record.date,
       note: record.note || '',
       type: record.type,
@@ -385,7 +391,7 @@ const App = () => {
     currentCurrencyRef.current = 'HKD';
     setFormData({
       amount: '',
-      category: lang === 'zh' ? '餐飲' : 'Food',
+      category: getDefaultCategoryValue(),
       date: new Date().toISOString().split('T')[0],
       note: '',
       type: 'expense',
@@ -399,10 +405,10 @@ const App = () => {
     const parsed = parseFloat(foreignAmt);
     if (!parsed || isNaN(parsed)) return;
     setRateInfo({ rate: null, loading: true, error: false });
-    fetch(`https://api.frankfurter.app/latest?from=${currency}&to=HKD`)
+    fetch(`https://api.frankfurter.dev/v2/rate/${currency}/HKD`)
       .then(r => r.json())
       .then(data => {
-        const rate = data.rates?.HKD;
+        const rate = data.rate;
         if (!rate) {
           setRateInfo({ rate: null, loading: false, error: true });
           return;
@@ -432,6 +438,11 @@ const App = () => {
     }
   };
 
+  const categoryOptions = useMemo(
+    () => getCategoryOptions(lang, formData.category),
+    [lang, formData.category]
+  );
+
   const exportToExcel = () => {
     if (!window.XLSX) return;
     const worksheet = window.XLSX.utils.json_to_sheet(transactions);
@@ -455,12 +466,13 @@ const App = () => {
   
   // Donut Chart Logic (using filtered data)
   const categoryTotals = filteredTransactions.reduce((acc, curr) => {
-    acc[curr.category] = (acc[curr.category] || 0) + curr.amount;
+    const categoryKey = getCanonicalCategoryValue(curr.category);
+    acc[categoryKey] = (acc[categoryKey] || 0) + curr.amount;
     return acc;
   }, {});
 
   const donutChartData = {
-    labels: Object.keys(categoryTotals),
+    labels: Object.keys(categoryTotals).map(category => getCategoryLabel(category, lang)),
     datasets: [{
       data: Object.values(categoryTotals),
       backgroundColor: ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#64748B'],
@@ -745,7 +757,7 @@ const App = () => {
                       <td className="px-8 py-5 text-sm font-medium text-slate-600 font-mono">{tx.date}</td>
                       <td className="px-8 py-5">
                         <span className="px-3 py-1 bg-blue-50 text-blue-600 text-[10px] font-black uppercase tracking-wider rounded-lg">
-                          {tx.category}
+                          {getCategoryLabel(tx.category, lang)}
                         </span>
                       </td>
                       <td className="px-8 py-5 text-sm text-slate-400 italic font-medium">{tx.note || '-'}</td>
@@ -796,7 +808,7 @@ const App = () => {
               <div>
                 <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('selectCurrency')}</label>
                 <div className="flex gap-2 flex-wrap">
-                  {['HKD','USD','EUR','GBP','JPY','CNY','AUD','SGD','KRW'].map(c => (
+                  {['HKD','USD','EUR','GBP','TWD','JPY','CNY','AUD','SGD','KRW'].map(c => (
                     <button key={c} type="button"
                       onClick={() => handleCurrencyChange(c)}
                       className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${formData.currency === c ? 'bg-blue-600 text-white shadow-md shadow-blue-100' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
@@ -866,7 +878,9 @@ const App = () => {
                 <div>
                   <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('category')}</label>
                   <select className="w-full px-4 py-3.5 bg-slate-50 rounded-2xl text-sm font-bold outline-none cursor-pointer" value={formData.category} onChange={(e) => setFormData({...formData, category: e.target.value})}>
-                    {(lang === 'zh' ? ['餐飲', '交通', '購物', '娛樂', '房租', '其他'] : ['Food', 'Transport', 'Shopping', 'Entertainment', 'Rent', 'Other']).map(cat => <option key={cat}>{cat}</option>)}
+                    {categoryOptions.map(cat => (
+                      <option key={cat.value} value={cat.value}>{cat.label}</option>
+                    ))}
                   </select>
                 </div>
               </div>
