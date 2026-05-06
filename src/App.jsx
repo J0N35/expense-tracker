@@ -133,6 +133,34 @@ ChartJS.register(
   DoughnutController
 );
 
+const SESSION_KEY = 'expense_tracker_db';
+
+const saveDbToSession = (targetDb) => {
+  if (!targetDb) return;
+  try {
+    const data = targetDb.export();
+    const base64 = btoa(Array.from(data).map(b => String.fromCharCode(b)).join(''));
+    sessionStorage.setItem(SESSION_KEY, base64);
+  } catch (e) {
+    console.warn('Failed to cache DB to sessionStorage', e);
+  }
+};
+
+const loadDbFromSession = (SQL) => {
+  try {
+    const cached = sessionStorage.getItem(SESSION_KEY);
+    if (!cached) return null;
+    const binary = atob(cached);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new SQL.Database(bytes);
+  } catch (e) {
+    console.warn('Failed to restore DB from sessionStorage', e);
+    sessionStorage.removeItem(SESSION_KEY);
+    return null;
+  }
+};
+
 const App = () => {
   const { t, lang, setLang } = useI18n();
   // State Management
@@ -167,17 +195,20 @@ const App = () => {
       window.initSqlJs({
         locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}`
       }).then(SQL => {
-        const initialDb = new SQL.Database();
-        initialDb.run(`
-          CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            amount REAL NOT NULL,
-            category TEXT NOT NULL,
-            date TEXT NOT NULL,
-            note TEXT,
-            type TEXT NOT NULL
-          )
-        `);
+        const restoredDb = loadDbFromSession(SQL);
+        const initialDb = restoredDb || new SQL.Database();
+        if (!restoredDb) {
+          initialDb.run(`
+            CREATE TABLE IF NOT EXISTS transactions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              amount REAL NOT NULL,
+              category TEXT NOT NULL,
+              date TEXT NOT NULL,
+              note TEXT,
+              type TEXT NOT NULL
+            )
+          `);
+        }
         setDb(initialDb);
         setLibsReady(prev => ({ ...prev, sql: true }));
         refreshData(initialDb);
@@ -228,6 +259,7 @@ const App = () => {
       setDb(newDb);
       setIsDbLoaded(true);
       refreshData(newDb);
+      saveDbToSession(newDb);
     };
     reader.readAsArrayBuffer(file);
   };
@@ -263,6 +295,7 @@ const App = () => {
     refreshData();
     closeModal();
     setHasUnsavedChanges(true);
+    saveDbToSession(db);
   };
 
   const deleteRecord = (id) => {
@@ -270,6 +303,7 @@ const App = () => {
     db.run("DELETE FROM transactions WHERE id = ?", [id]);
     refreshData();
     setHasUnsavedChanges(true);
+    saveDbToSession(db);
   };
 
   const startEdit = (record) => {
