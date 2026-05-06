@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 // i18n dictionary
 const translations = {
   zh: {
@@ -40,6 +40,12 @@ const translations = {
     expense: '支出',
     income: '收入',
     close: '關閉',
+    selectCurrency: '貨幣',
+    foreignAmt: '外幣金額',
+    hkdAmt: 'HKD 金額',
+    fetchingRate: '換算中...',
+    rateError: '換算失敗，請手動輸入 HKD',
+    rateLabel: '匯率',
   },
   en: {
     dashboard: 'Dashboard',
@@ -80,6 +86,12 @@ const translations = {
     expense: 'Expense',
     income: 'Income',
     close: 'Close',
+    selectCurrency: 'Currency',
+    foreignAmt: 'Foreign Amount',
+    hkdAmt: 'HKD Amount',
+    fetchingRate: 'Fetching rate...',
+    rateError: 'Conversion failed – enter HKD manually',
+    rateLabel: 'Rate',
   }
 };
 
@@ -135,6 +147,21 @@ ChartJS.register(
 
 const SESSION_KEY = 'expense_tracker_db';
 
+// Ensures the `tag` column exists (migration for older DBs)
+const ensureTagColumn = (targetDb) => {
+  try {
+    const info = targetDb.exec("PRAGMA table_info(transactions)");
+    if (info.length > 0) {
+      const hasTag = info[0].values.some(row => row[1] === 'tag');
+      if (!hasTag) {
+        targetDb.run("ALTER TABLE transactions ADD COLUMN tag TEXT DEFAULT ''");
+      }
+    }
+  } catch (e) {
+    console.warn('Tag column migration failed', e);
+  }
+};
+
 const saveDbToSession = (targetDb) => {
   if (!targetDb) return;
   try {
@@ -189,8 +216,12 @@ const App = () => {
     category: lang === 'zh' ? '餐飲' : 'Food',
     date: new Date().toISOString().split('T')[0],
     note: '',
-    type: 'expense'
+    type: 'expense',
+    currency: 'HKD',
+    foreignAmount: ''
   });
+  const [rateInfo, setRateInfo] = useState({ rate: null, loading: false, error: false });
+  const conversionTimerRef = useRef(null);
 
   // Load External Libraries via CDN
   useEffect(() => {
@@ -211,9 +242,12 @@ const App = () => {
               category TEXT NOT NULL,
               date TEXT NOT NULL,
               note TEXT,
-              type TEXT NOT NULL
+              type TEXT NOT NULL,
+              tag TEXT DEFAULT ''
             )
           `);
+        } else {
+          ensureTagColumn(initialDb);
         }
         setDb(initialDb);
         setLibsReady(prev => ({ ...prev, sql: true }));
@@ -263,6 +297,7 @@ const App = () => {
         locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}`
       });
       const newDb = new SQL.Database(Uints);
+      ensureTagColumn(newDb);
       setDb(newDb);
       setIsDbLoaded(true);
       refreshData(newDb);
@@ -287,15 +322,19 @@ const App = () => {
     e.preventDefault();
     if (!db) return;
 
+    const tag = formData.currency !== 'HKD' && formData.foreignAmount
+      ? `${formData.currency}:${formData.foreignAmount}`
+      : '';
+
     if (editingId) {
       db.run(
-        "UPDATE transactions SET amount = ?, category = ?, date = ?, note = ?, type = ? WHERE id = ?",
-        [formData.amount, formData.category, formData.date, formData.note, formData.type, editingId]
+        "UPDATE transactions SET amount = ?, category = ?, date = ?, note = ?, type = ?, tag = ? WHERE id = ?",
+        [formData.amount, formData.category, formData.date, formData.note, formData.type, tag, editingId]
       );
     } else {
       db.run(
-        "INSERT INTO transactions (amount, category, date, note, type) VALUES (?, ?, ?, ?, ?)",
-        [formData.amount, formData.category, formData.date, formData.note, formData.type]
+        "INSERT INTO transactions (amount, category, date, note, type, tag) VALUES (?, ?, ?, ?, ?, ?)",
+        [formData.amount, formData.category, formData.date, formData.note, formData.type, tag]
       );
     }
     
@@ -315,17 +354,30 @@ const App = () => {
 
   const startEdit = (record) => {
     setEditingId(record.id);
+    let currency = 'HKD';
+    let foreignAmount = '';
+    if (record.tag) {
+      const parts = record.tag.split(':');
+      if (parts.length === 2 && parts[0] && parts[1]) {
+        currency = parts[0];
+        foreignAmount = parts[1];
+      }
+    }
     setFormData({
       amount: record.amount,
       category: record.category,
       date: record.date,
       note: record.note || '',
-      type: record.type
+      type: record.type,
+      currency,
+      foreignAmount
     });
+    setRateInfo({ rate: null, loading: false, error: false });
     setIsModalOpen(true);
   };
 
   const closeModal = () => {
+    clearTimeout(conversionTimerRef.current);
     setIsModalOpen(false);
     setEditingId(null);
     setFormData({
@@ -333,8 +385,41 @@ const App = () => {
       category: lang === 'zh' ? '餐飲' : 'Food',
       date: new Date().toISOString().split('T')[0],
       note: '',
-      type: 'expense'
+      type: 'expense',
+      currency: 'HKD',
+      foreignAmount: ''
     });
+    setRateInfo({ rate: null, loading: false, error: false });
+  };
+
+  const fetchAndConvert = useCallback((currency, foreignAmt) => {
+    setRateInfo({ rate: null, loading: true, error: false });
+    fetch(`https://api.frankfurter.app/latest?from=${currency}&to=HKD`)
+      .then(r => r.json())
+      .then(data => {
+        const rate = data.rates.HKD;
+        const hkd = (parseFloat(foreignAmt) * rate).toFixed(2);
+        setFormData(f => ({ ...f, amount: hkd }));
+        setRateInfo({ rate, loading: false, error: false });
+      })
+      .catch(() => {
+        setRateInfo({ rate: null, loading: false, error: true });
+      });
+  }, []);
+
+  const handleCurrencyChange = (currency) => {
+    setFormData(f => ({ ...f, currency, foreignAmount: '', amount: '' }));
+    setRateInfo({ rate: null, loading: false, error: false });
+    clearTimeout(conversionTimerRef.current);
+  };
+
+  const handleForeignAmountChange = (val) => {
+    setFormData(f => ({ ...f, foreignAmount: val }));
+    if (val && parseFloat(val) > 0) {
+      clearTimeout(conversionTimerRef.current);
+      const curr = formData.currency;
+      conversionTimerRef.current = setTimeout(() => fetchAndConvert(curr, val), 600);
+    }
   };
 
   const exportToExcel = () => {
@@ -653,8 +738,15 @@ const App = () => {
                       </td>
                       <td className="px-8 py-5 text-sm text-slate-400 italic font-medium">{tx.note || '-'}</td>
                       <td className="px-8 py-5 text-sm font-black text-right text-slate-900 whitespace-nowrap">
-                        <span className="text-[10px] text-slate-300 mr-1 font-normal">{t('HKDE')}</span>
-                        {tx.amount.toLocaleString()}
+                        {tx.tag ? (
+                          <div className="text-[10px] text-violet-500 font-bold mb-0.5">
+                            {tx.tag.split(':')[0]} {parseFloat(tx.tag.split(':')[1]).toLocaleString()}
+                          </div>
+                        ) : null}
+                        <div>
+                          <span className="text-[10px] text-slate-300 mr-1 font-normal">{t('HKDE')}</span>
+                          {tx.amount.toLocaleString()}
+                        </div>
                       </td>
                       <td className="px-8 py-5">
                         <div className="flex items-center justify-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -687,13 +779,72 @@ const App = () => {
               <button onClick={closeModal} className="p-2 hover:bg-slate-200 rounded-full transition-colors text-slate-400" aria-label={t('close')}><X size={20} /></button>
             </div>
             <form onSubmit={handleSaveExpense} className="p-8 space-y-6">
+              {/* Currency selector */}
               <div>
-                <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('amount')} (HKD)</label>
-                <div className="relative">
-                  <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
-                  <input autoFocus type="number" required step="0.1" className="w-full pl-10 pr-4 py-4 bg-slate-50 border-2 border-transparent focus:border-blue-600 rounded-2xl font-black text-xl outline-none transition-all" value={formData.amount} onChange={(e) => setFormData({...formData, amount: parseFloat(e.target.value) || ''})} />
+                <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('selectCurrency')}</label>
+                <div className="flex gap-2 flex-wrap">
+                  {['HKD','USD','EUR','GBP','JPY','CNY','AUD','SGD','KRW'].map(c => (
+                    <button key={c} type="button"
+                      onClick={() => handleCurrencyChange(c)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${formData.currency === c ? 'bg-blue-600 text-white shadow-md shadow-blue-100' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                    >
+                      {c}
+                    </button>
+                  ))}
                 </div>
               </div>
+
+              {formData.currency === 'HKD' ? (
+                /* HKD – single amount field */
+                <div>
+                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('amount')} (HKD)</label>
+                  <div className="relative">
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
+                    <input autoFocus type="number" required step="0.01" min="0"
+                      className="w-full pl-10 pr-4 py-4 bg-slate-50 border-2 border-transparent focus:border-blue-600 rounded-2xl font-black text-xl outline-none transition-all"
+                      value={formData.amount}
+                      onChange={(e) => setFormData({...formData, amount: e.target.value})} />
+                  </div>
+                </div>
+              ) : (
+                /* Foreign currency – two fields with auto-conversion */
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('foreignAmt')} ({formData.currency})</label>
+                    <div className="relative">
+                      <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">{formData.currency}</span>
+                      <input autoFocus type="number" required step="0.01" min="0"
+                        className="w-full pl-14 pr-4 py-4 bg-slate-50 border-2 border-transparent focus:border-blue-600 rounded-2xl font-black text-xl outline-none transition-all"
+                        value={formData.foreignAmount}
+                        onChange={(e) => handleForeignAmountChange(e.target.value)} />
+                    </div>
+                  </div>
+                  {/* Rate info */}
+                  <div className="flex items-center gap-2 min-h-[1.25rem]">
+                    {rateInfo.loading && (
+                      <span className="text-[11px] text-slate-400 italic">{t('fetchingRate')}</span>
+                    )}
+                    {rateInfo.rate && !rateInfo.loading && (
+                      <span className="text-[11px] text-emerald-600 font-bold">
+                        {t('rateLabel')}: 1 {formData.currency} = {rateInfo.rate.toFixed(4)} HKD
+                      </span>
+                    )}
+                    {rateInfo.error && (
+                      <span className="text-[11px] text-rose-500 font-bold">{t('rateError')}</span>
+                    )}
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('hkdAmt')}</label>
+                    <div className="relative">
+                      <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
+                      <input type="number" required step="0.01" min="0"
+                        className="w-full pl-10 pr-4 py-4 bg-slate-50 border-2 border-blue-200 focus:border-blue-600 rounded-2xl font-black text-xl outline-none transition-all"
+                        value={formData.amount}
+                        onChange={(e) => setFormData({...formData, amount: e.target.value})} />
+                    </div>
+                  </div>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('date')}</label>
