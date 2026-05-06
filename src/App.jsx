@@ -38,7 +38,7 @@ const translations = {
     loadSqlite: '載入 SQLite',
     saveDownload: '儲存並下載',
     exportExcel: '導出 Excel',
-    currency: '貨幣：HKD',
+    currency: '顯示貨幣',
     HKDE: 'HKD',
     confirmDelete: '確定要刪除此紀錄嗎？',
     placeholderNote: '備註...',
@@ -52,6 +52,15 @@ const translations = {
     fetchingRate: '換算中...',
     rateError: '換算失敗，請手動輸入 HKD',
     rateLabel: '匯率',
+    defaultCurrency: '預設顯示貨幣',
+    baseCurrency: '資料基準貨幣',
+    ratePending: '等待匯率，暫以基準貨幣顯示',
+    rateUnavailable: '無法取得匯率，暫以基準貨幣顯示',
+    switchWarningTitle: '切換顯示貨幣？',
+    switchWarningBody: '已載入的歷史支出會按目前匯率換算，不會使用歷史匯率。',
+    continueSwitch: '仍要切換',
+    baseAmt: '基準貨幣金額',
+    exportCurrencyFail: '無法取得匯率，暫時不能轉換並匯出。',
   },
   en: {
     dashboard: 'Dashboard',
@@ -84,7 +93,7 @@ const translations = {
     loadSqlite: 'Load SQLite',
     saveDownload: 'Save & Download',
     exportExcel: 'Export Excel',
-    currency: 'Currency: HKD',
+    currency: 'Display Currency',
     HKDE: 'HKD',
     confirmDelete: 'Are you sure you want to delete this record?',
     placeholderNote: 'Note...',
@@ -98,6 +107,15 @@ const translations = {
     fetchingRate: 'Fetching rate...',
     rateError: 'Conversion failed – enter HKD manually',
     rateLabel: 'Rate',
+    defaultCurrency: 'Default Display Currency',
+    baseCurrency: 'Data Base Currency',
+    ratePending: 'Waiting for exchange rate, showing base currency for now',
+    rateUnavailable: 'Exchange rate unavailable, showing base currency for now',
+    switchWarningTitle: 'Switch display currency?',
+    switchWarningBody: 'Historical expenses will be converted using current exchange rates, not historical rates.',
+    continueSwitch: 'Switch anyway',
+    baseAmt: 'Base Currency Amount',
+    exportCurrencyFail: 'Cannot fetch exchange rate, export conversion is unavailable right now.',
   }
 };
 
@@ -152,6 +170,23 @@ ChartJS.register(
 );
 
 const SESSION_KEY = 'expense_tracker_db';
+const SESSION_CURRENCY_KEY = 'expense_tracker_db_currency';
+const CURRENCY_OPTIONS = ['HKD', 'USD', 'EUR', 'GBP', 'TWD', 'JPY', 'CNY', 'AUD', 'SGD', 'KRW'];
+
+const readTransactionsFromDb = (targetDb) => {
+  if (!targetDb) return [];
+  const res = targetDb.exec('SELECT * FROM transactions ORDER BY date DESC');
+  if (res.length === 0) return [];
+  const columns = res[0].columns;
+  const values = res[0].values;
+  return values.map(row => {
+    const obj = {};
+    columns.forEach((col, i) => {
+      obj[col] = row[i];
+    });
+    return obj;
+  });
+};
 
 // Ensures the `tag` column exists (migration for older DBs)
 const ensureTagColumn = (targetDb) => {
@@ -168,21 +203,22 @@ const ensureTagColumn = (targetDb) => {
   }
 };
 
-const saveDbToSession = (targetDb) => {
+const saveDbToSession = (targetDb, currencyCode = 'HKD') => {
   if (!targetDb) return;
   try {
     const data = targetDb.export();
     const base64 = btoa(Array.from(data).map(b => String.fromCharCode(b)).join(''));
     sessionStorage.setItem(SESSION_KEY, base64);
+    sessionStorage.setItem(SESSION_CURRENCY_KEY, currencyCode);
   } catch (e) {
     console.warn('Failed to cache DB to sessionStorage', e);
   }
 };
 
 let _saveDebounceTimer = null;
-const debouncedSaveDbToSession = (targetDb) => {
+const debouncedSaveDbToSession = (targetDb, currencyCode = 'HKD') => {
   clearTimeout(_saveDebounceTimer);
-  _saveDebounceTimer = setTimeout(() => saveDbToSession(targetDb), 500);
+  _saveDebounceTimer = setTimeout(() => saveDbToSession(targetDb, currencyCode), 500);
 };
 
 const loadDbFromSession = (SQL) => {
@@ -192,10 +228,12 @@ const loadDbFromSession = (SQL) => {
     const binary = atob(cached);
     const bytes = new Uint8Array(binary.length);
     for (let byteIndex = 0; byteIndex < binary.length; byteIndex++) bytes[byteIndex] = binary.charCodeAt(byteIndex);
-    return new SQL.Database(bytes);
+    const currencyCode = sessionStorage.getItem(SESSION_CURRENCY_KEY) || 'HKD';
+    return { db: new SQL.Database(bytes), currencyCode };
   } catch (e) {
     console.warn('Failed to restore DB from sessionStorage', e);
     sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(SESSION_CURRENCY_KEY);
     return null;
   }
 };
@@ -211,6 +249,13 @@ const App = () => {
   const [editingId, setEditingId] = useState(null);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [libsReady, setLibsReady] = useState({ sql: false, xlsx: false });
+  const [defaultCurrency, setDefaultCurrency] = useState('HKD');
+  const [dbCurrency, setDbCurrency] = useState('HKD');
+  const [pendingDefaultCurrency, setPendingDefaultCurrency] = useState(null);
+  const [showCurrencyWarning, setShowCurrencyWarning] = useState(false);
+  const [displayRateInfo, setDisplayRateInfo] = useState({ loading: false, error: false, rate: 1 });
+  const fxRateCacheRef = useRef({});
+  const fxRatePromiseRef = useRef({});
 
   // Filters
   const [timeFilter, setTimeFilter] = useState('this-month'); // this-month, selected-month, all
@@ -230,6 +275,35 @@ const App = () => {
   const conversionTimerRef = useRef(null);
   const currentCurrencyRef = useRef('HKD');
 
+  const shouldWarnDefaultCurrencySwitch = isDbLoaded && transactions.length > 0;
+
+  const getExchangeRate = useCallback(async (fromCurrency, toCurrency) => {
+    if (fromCurrency === toCurrency) return 1;
+    const key = `${fromCurrency}->${toCurrency}`;
+    const cached = fxRateCacheRef.current[key];
+    if (cached) return cached;
+
+    if (fxRatePromiseRef.current[key]) {
+      return fxRatePromiseRef.current[key];
+    }
+
+    const request = fetch(`https://api.frankfurter.dev/v2/rate/${fromCurrency}/${toCurrency}`)
+      .then(response => response.json())
+      .then(data => {
+        if (!data.rate) {
+          throw new Error(`Missing rate for ${key}`);
+        }
+        fxRateCacheRef.current[key] = data.rate;
+        return data.rate;
+      })
+      .finally(() => {
+        delete fxRatePromiseRef.current[key];
+      });
+
+    fxRatePromiseRef.current[key] = request;
+    return request;
+  }, []);
+
   // Load External Libraries via CDN
   useEffect(() => {
     const sqlScript = document.createElement("script");
@@ -239,9 +313,9 @@ const App = () => {
       window.initSqlJs({
         locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}`
       }).then(SQL => {
-        const restoredDb = loadDbFromSession(SQL);
-        const initialDb = restoredDb || new SQL.Database();
-        if (!restoredDb) {
+        const restoredState = loadDbFromSession(SQL);
+        const initialDb = restoredState?.db || new SQL.Database();
+        if (!restoredState?.db) {
           initialDb.run(`
             CREATE TABLE IF NOT EXISTS transactions (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,8 +331,10 @@ const App = () => {
           ensureTagColumn(initialDb);
         }
         setDb(initialDb);
+        setDbCurrency(restoredState?.currencyCode || 'HKD');
+        setDefaultCurrency(restoredState?.currencyCode || 'HKD');
         setLibsReady(prev => ({ ...prev, sql: true }));
-        setHasUnsavedChanges(!!restoredDb);
+        setHasUnsavedChanges(!!restoredState?.db);
         refreshData(initialDb);
       });
     };
@@ -276,19 +352,7 @@ const App = () => {
     const activeDb = targetDb || db;
     if (!activeDb) return;
     try {
-      const res = activeDb.exec("SELECT * FROM transactions ORDER BY date DESC");
-      if (res.length > 0) {
-        const columns = res[0].columns;
-        const values = res[0].values;
-        const formatted = values.map(row => {
-          const obj = {};
-          columns.forEach((col, i) => obj[col] = row[i]);
-          return obj;
-        });
-        setTransactions(formatted);
-      } else {
-        setTransactions([]);
-      }
+      setTransactions(readTransactionsFromDb(activeDb));
     } catch (e) {
       console.error("Database query failed", e);
     }
@@ -306,22 +370,52 @@ const App = () => {
       const newDb = new SQL.Database(Uints);
       ensureTagColumn(newDb);
       setDb(newDb);
+      setDbCurrency('HKD');
+      setDefaultCurrency('HKD');
       setIsDbLoaded(true);
       refreshData(newDb);
-      saveDbToSession(newDb);
+      saveDbToSession(newDb, 'HKD');
     };
     reader.readAsArrayBuffer(file);
   };
 
-  const downloadDb = () => {
+  const rewriteDbToCurrency = useCallback(async (targetCurrency) => {
+    if (!db || targetCurrency === dbCurrency) return true;
+    try {
+      const rate = await getExchangeRate(dbCurrency, targetCurrency);
+      db.run('BEGIN TRANSACTION');
+      db.run('UPDATE transactions SET amount = ROUND(amount * ?, 2), tag = ""', [rate]);
+      db.run('COMMIT');
+      setDbCurrency(targetCurrency);
+      refreshData(db);
+      setHasUnsavedChanges(true);
+      debouncedSaveDbToSession(db, targetCurrency);
+      return true;
+    } catch (e) {
+      try {
+        db.run('ROLLBACK');
+      } catch (_) {
+        // no-op
+      }
+      console.error('Failed to rewrite DB currency', e);
+      window.alert(t('exportCurrencyFail'));
+      return false;
+    }
+  }, [db, dbCurrency, getExchangeRate, t]);
+
+  const downloadDb = async () => {
     if (!db) return;
+    const rewritten = await rewriteDbToCurrency(defaultCurrency);
+    if (!rewritten) return;
+
     const data = db.export();
     const blob = new Blob([data]);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `expense_tracker_hkd_${new Date().toISOString().split('T')[0]}.sqlite`;
+    a.download = `expense_tracker_${defaultCurrency.toLowerCase()}_${new Date().toISOString().split('T')[0]}.sqlite`;
     a.click();
+    saveDbToSession(db, defaultCurrency);
     setHasUnsavedChanges(false);
   };
 
@@ -329,7 +423,7 @@ const App = () => {
     e.preventDefault();
     if (!db) return;
 
-    const tag = formData.currency !== 'HKD' && formData.foreignAmount
+    const tag = formData.currency !== dbCurrency && formData.foreignAmount
       ? `${formData.currency}:${formData.foreignAmount}`
       : '';
 
@@ -348,7 +442,7 @@ const App = () => {
     refreshData();
     closeModal();
     setHasUnsavedChanges(true);
-    debouncedSaveDbToSession(db);
+    debouncedSaveDbToSession(db, dbCurrency);
   };
 
   const deleteRecord = (id) => {
@@ -356,12 +450,12 @@ const App = () => {
     db.run("DELETE FROM transactions WHERE id = ?", [id]);
     refreshData();
     setHasUnsavedChanges(true);
-    debouncedSaveDbToSession(db);
+    debouncedSaveDbToSession(db, dbCurrency);
   };
 
   const startEdit = (record) => {
     setEditingId(record.id);
-    let currency = 'HKD';
+    let currency = dbCurrency;
     let foreignAmount = '';
     if (record.tag) {
       const parts = record.tag.split(':');
@@ -388,14 +482,14 @@ const App = () => {
     clearTimeout(conversionTimerRef.current);
     setIsModalOpen(false);
     setEditingId(null);
-    currentCurrencyRef.current = 'HKD';
+    currentCurrencyRef.current = defaultCurrency;
     setFormData({
       amount: '',
       category: getDefaultCategoryValue(),
       date: new Date().toISOString().split('T')[0],
       note: '',
       type: 'expense',
-      currency: 'HKD',
+      currency: defaultCurrency,
       foreignAmount: ''
     });
     setRateInfo({ rate: null, loading: false, error: false });
@@ -405,22 +499,20 @@ const App = () => {
     const parsed = parseFloat(foreignAmt);
     if (!parsed || isNaN(parsed)) return;
     setRateInfo({ rate: null, loading: true, error: false });
-    fetch(`https://api.frankfurter.dev/v2/rate/${currency}/HKD`)
-      .then(r => r.json())
-      .then(data => {
-        const rate = data.rate;
+    getExchangeRate(currency, dbCurrency)
+      .then(rate => {
         if (!rate) {
           setRateInfo({ rate: null, loading: false, error: true });
           return;
         }
-        const hkd = (parsed * rate).toFixed(2);
-        setFormData(f => ({ ...f, amount: hkd }));
+        const baseAmount = (parsed * rate).toFixed(2);
+        setFormData(f => ({ ...f, amount: baseAmount }));
         setRateInfo({ rate, loading: false, error: false });
       })
       .catch(() => {
         setRateInfo({ rate: null, loading: false, error: true });
       });
-  }, []);
+  }, [dbCurrency, getExchangeRate]);
 
   const handleCurrencyChange = (currency) => {
     currentCurrencyRef.current = currency;
@@ -443,31 +535,96 @@ const App = () => {
     [lang, formData.category]
   );
 
-  const exportToExcel = () => {
+  useEffect(() => {
+    let ignore = false;
+    if (defaultCurrency === dbCurrency) {
+      setDisplayRateInfo({ loading: false, error: false, rate: 1 });
+      return undefined;
+    }
+
+    setDisplayRateInfo({ loading: true, error: false, rate: 1 });
+    getExchangeRate(dbCurrency, defaultCurrency)
+      .then((rate) => {
+        if (ignore) return;
+        setDisplayRateInfo({ loading: false, error: false, rate });
+      })
+      .catch(() => {
+        if (ignore) return;
+        setDisplayRateInfo({ loading: false, error: true, rate: 1 });
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, [defaultCurrency, dbCurrency, getExchangeRate]);
+
+  const requestDefaultCurrencyChange = (currency) => {
+    if (currency === defaultCurrency) return;
+    if (shouldWarnDefaultCurrencySwitch) {
+      setPendingDefaultCurrency(currency);
+      setShowCurrencyWarning(true);
+      return;
+    }
+    setDefaultCurrency(currency);
+  };
+
+  const confirmDefaultCurrencyChange = () => {
+    if (pendingDefaultCurrency) {
+      setDefaultCurrency(pendingDefaultCurrency);
+    }
+    setPendingDefaultCurrency(null);
+    setShowCurrencyWarning(false);
+  };
+
+  const cancelDefaultCurrencyChange = () => {
+    setPendingDefaultCurrency(null);
+    setShowCurrencyWarning(false);
+  };
+
+  const displayMultiplier = defaultCurrency === dbCurrency
+    ? 1
+    : (displayRateInfo.error ? 1 : displayRateInfo.rate);
+
+  const transactionsWithDisplayAmount = useMemo(
+    () => transactions.map(tx => ({
+      ...tx,
+      displayAmount: Number((tx.amount * displayMultiplier).toFixed(2)),
+    })),
+    [transactions, displayMultiplier]
+  );
+
+  const exportToExcel = async () => {
     if (!window.XLSX) return;
-    const worksheet = window.XLSX.utils.json_to_sheet(transactions);
+    const rewritten = await rewriteDbToCurrency(defaultCurrency);
+    if (!rewritten) return;
+
+    const rows = readTransactionsFromDb(db).map(row => ({
+      ...row,
+      currency: defaultCurrency,
+    }));
+    const worksheet = window.XLSX.utils.json_to_sheet(rows);
     const workbook = window.XLSX.utils.book_new();
     window.XLSX.utils.book_append_sheet(workbook, worksheet, "Transactions");
-    window.XLSX.writeFile(workbook, "expenses_hk_export.xlsx");
+    window.XLSX.writeFile(workbook, `expenses_${defaultCurrency.toLowerCase()}_export.xlsx`);
   };
 
   // --- Filtered Data ---
   const filteredTransactions = useMemo(() => {
-    if (timeFilter === 'all') return transactions;
+    if (timeFilter === 'all') return transactionsWithDisplayAmount;
     
     const target = timeFilter === 'this-month' 
       ? new Date().toISOString().slice(0, 7) 
       : selectedMonth;
       
-    return transactions.filter(t => t.date.startsWith(target));
-  }, [transactions, timeFilter, selectedMonth]);
+    return transactionsWithDisplayAmount.filter(t => t.date.startsWith(target));
+  }, [transactionsWithDisplayAmount, timeFilter, selectedMonth]);
 
   // --- Analytics Logic ---
   
   // Donut Chart Logic (using filtered data)
   const categoryTotals = filteredTransactions.reduce((acc, curr) => {
     const categoryKey = getCanonicalCategoryValue(curr.category);
-    acc[categoryKey] = (acc[categoryKey] || 0) + curr.amount;
+    acc[categoryKey] = (acc[categoryKey] || 0) + curr.displayAmount;
     return acc;
   }, {});
 
@@ -485,14 +642,14 @@ const App = () => {
   // Average Monthly Expense
   const avgMonthlyExpense = useMemo(() => {
     if (transactions.length === 0) return 0;
-    const monthlyBuckets = transactions.reduce((acc, curr) => {
+    const monthlyBuckets = transactionsWithDisplayAmount.reduce((acc, curr) => {
       const month = curr.date.slice(0, 7);
-      acc[month] = (acc[month] || 0) + curr.amount;
+      acc[month] = (acc[month] || 0) + curr.displayAmount;
       return acc;
     }, {});
     const totals = Object.values(monthlyBuckets);
     return totals.reduce((a, b) => a + b, 0) / totals.length;
-  }, [transactions]);
+  }, [transactionsWithDisplayAmount]);
 
   // Daily Trend Chart (filtered, with previous month compare)
   const getTrendChartData = () => {
@@ -501,7 +658,7 @@ const App = () => {
     filteredTransactions.forEach(tx => {
       const d = new Date(tx.date);
       const day = d.getDate();
-      dayData[day - 1] += tx.amount;
+      dayData[day - 1] += tx.displayAmount;
     });
 
     // Previous month logic
@@ -514,10 +671,10 @@ const App = () => {
     }
     const prevMonthData = new Array(daysInMonth).fill(0);
     if (prevMonth) {
-      transactions.filter(tx => tx.date.startsWith(prevMonth)).forEach(tx => {
+      transactionsWithDisplayAmount.filter(tx => tx.date.startsWith(prevMonth)).forEach(tx => {
         const d = new Date(tx.date);
         const day = d.getDate();
-        prevMonthData[day - 1] += tx.amount;
+        prevMonthData[day - 1] += tx.displayAmount;
       });
     }
 
@@ -569,7 +726,7 @@ const App = () => {
           </div>
           <div>
             <h1 className="font-black text-xl text-slate-800 leading-none tracking-tight">ExpTracker</h1>
-            <span className="text-[10px] text-blue-600 font-bold uppercase tracking-widest">HK Edition</span>
+            <span className="text-[10px] text-blue-600 font-bold uppercase tracking-widest">Private & Local Only</span>
           </div>
         </div>
 
@@ -615,8 +772,24 @@ const App = () => {
             </h2>
             <div className="flex items-center gap-2 mt-1">
               <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              <p className="text-sm text-slate-500 font-medium italic">{t('currency')}</p>
+              <label className="text-sm text-slate-500 font-medium italic">{t('currency')}:</label>
+              <select
+                value={defaultCurrency}
+                onChange={(e) => requestDefaultCurrencyChange(e.target.value)}
+                className="text-sm font-bold bg-slate-100 text-slate-700 rounded-lg px-2.5 py-1 outline-none focus:ring-2 focus:ring-blue-200"
+              >
+                {CURRENCY_OPTIONS.map(c => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
             </div>
+            <p className="text-xs text-slate-400 mt-1">{t('baseCurrency')}: {dbCurrency}</p>
+            {displayRateInfo.loading && defaultCurrency !== dbCurrency && (
+              <p className="text-xs text-amber-600 font-semibold mt-1">{t('ratePending')}</p>
+            )}
+            {displayRateInfo.error && defaultCurrency !== dbCurrency && (
+              <p className="text-xs text-rose-500 font-semibold mt-1">{t('rateUnavailable')}</p>
+            )}
           </div>
           <button 
             onClick={() => setIsModalOpen(true)}
@@ -670,13 +843,13 @@ const App = () => {
               <div className="bg-blue-600 p-6 rounded-3xl shadow-lg shadow-blue-100 text-white">
                 <p className="text-xs font-bold text-blue-200 uppercase tracking-widest mb-1">{t('totalExpense')}</p>
                 <p className="text-2xl font-black">
-                  HKD {filteredTransactions.reduce((s, t) => s + t.amount, 0).toLocaleString()}
+                  {defaultCurrency} {filteredTransactions.reduce((s, t) => s + t.displayAmount, 0).toLocaleString()}
                 </p>
               </div>
               <div className="bg-emerald-600 p-6 rounded-3xl shadow-lg shadow-emerald-100 text-white">
                 <p className="text-xs font-bold text-emerald-100 uppercase tracking-widest mb-1">{t('avgMonthly')}</p>
                 <p className="text-2xl font-black">
-                  HKD {avgMonthlyExpense.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                  {defaultCurrency} {avgMonthlyExpense.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                 </p>
               </div>
             </div>
@@ -768,8 +941,8 @@ const App = () => {
                           </div>
                         )}
                         <div>
-                          <span className="text-[10px] text-slate-300 mr-1 font-normal">{t('HKDE')}</span>
-                          {tx.amount.toLocaleString()}
+                          <span className="text-[10px] text-slate-300 mr-1 font-normal">{defaultCurrency}</span>
+                          {tx.displayAmount.toLocaleString()}
                         </div>
                       </td>
                       <td className="px-8 py-5">
@@ -808,7 +981,7 @@ const App = () => {
               <div>
                 <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('selectCurrency')}</label>
                 <div className="flex gap-2 flex-wrap">
-                  {['HKD','USD','EUR','GBP','TWD','JPY','CNY','AUD','SGD','KRW'].map(c => (
+                  {CURRENCY_OPTIONS.map(c => (
                     <button key={c} type="button"
                       onClick={() => handleCurrencyChange(c)}
                       className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${formData.currency === c ? 'bg-blue-600 text-white shadow-md shadow-blue-100' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
@@ -819,10 +992,10 @@ const App = () => {
                 </div>
               </div>
 
-              {formData.currency === 'HKD' ? (
+              {formData.currency === dbCurrency ? (
                 /* HKD – single amount field */
                 <div>
-                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('amount')} (HKD)</label>
+                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('amount')} ({dbCurrency})</label>
                   <div className="relative">
                     <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
                     <input autoFocus type="number" required step="0.01" min="0"
@@ -851,7 +1024,7 @@ const App = () => {
                     )}
                     {rateInfo.rate && !rateInfo.loading && (
                       <span className="text-[11px] text-emerald-600 font-bold">
-                        {t('rateLabel')}: 1 {formData.currency} = {rateInfo.rate.toFixed(4)} HKD
+                        {t('rateLabel')}: 1 {formData.currency} = {rateInfo.rate.toFixed(4)} {dbCurrency}
                       </span>
                     )}
                     {rateInfo.error && (
@@ -859,7 +1032,7 @@ const App = () => {
                     )}
                   </div>
                   <div>
-                    <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('hkdAmt')}</label>
+                    <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">{t('baseAmt')} ({dbCurrency})</label>
                     <div className="relative">
                       <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
                       <input type="number" required step="0.01" min="0"
@@ -890,6 +1063,36 @@ const App = () => {
                 <button type="submit" className="flex-[2] bg-blue-600 hover:bg-blue-700 text-white font-black py-4 rounded-2xl shadow-xl shadow-blue-100 transition-all">{editingId ? t('update') : t('save')}</button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Currency Switch Warning Modal */}
+      {showCurrencyWarning && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl w-full max-w-lg shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-300">
+            <div className="p-6 border-b border-slate-100 bg-slate-50/50">
+              <h3 className="text-xl font-black text-slate-800 tracking-tight">{t('switchWarningTitle')}</h3>
+            </div>
+            <div className="p-6 text-sm text-slate-600 leading-relaxed">
+              {t('switchWarningBody')}
+            </div>
+            <div className="p-6 pt-0 flex gap-3">
+              <button
+                type="button"
+                onClick={cancelDefaultCurrencyChange}
+                className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-3 rounded-xl transition-all"
+              >
+                {t('cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={confirmDefaultCurrencyChange}
+                className="flex-[1.2] bg-amber-500 hover:bg-amber-600 text-white font-black py-3 rounded-xl shadow-lg shadow-amber-100 transition-all"
+              >
+                {t('continueSwitch')}
+              </button>
+            </div>
           </div>
         </div>
       )}
