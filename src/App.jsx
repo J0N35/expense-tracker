@@ -265,7 +265,7 @@ const App = () => {
       setDb(newDb);
       setIsDbLoaded(true);
       refreshData(newDb);
-      debouncedSaveDbToSession(newDb);
+      saveDbToSession(newDb);
     };
     reader.readAsArrayBuffer(file);
   };
