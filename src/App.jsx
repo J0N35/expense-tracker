@@ -15,6 +15,7 @@ const translations = {
     totalExpense: '篩選總支出',
     avgMonthly: '平均每月支出',
     dailyTrend: '每日支出趨勢',
+    monthlyTrend: '每月支出趨勢',
     filtered: '篩選',
     categoryBreakdown: '支出分佈',
     allTime: '所有時間',
@@ -70,6 +71,7 @@ const translations = {
     totalExpense: 'Total Expense (Filtered)',
     avgMonthly: 'Avg. Monthly Expense',
     dailyTrend: 'Daily Expense Trend',
+    monthlyTrend: 'Monthly Expense Trend',
     filtered: 'FILTERED',
     categoryBreakdown: 'Category Breakdown',
     allTime: 'All Time',
@@ -651,8 +653,28 @@ const App = () => {
     return totals.reduce((a, b) => a + b, 0) / totals.length;
   }, [transactionsWithDisplayAmount]);
 
-  // Daily Trend Chart (filtered, with previous month compare)
+  // Daily/Monthly Trend Chart (filtered, with previous month compare)
   const getTrendChartData = () => {
+    // Monthly trend for "all time"
+    if (timeFilter === 'all') {
+      const monthlyBuckets = {};
+      transactionsWithDisplayAmount.forEach(tx => {
+        const month = tx.date.slice(0, 7);
+        monthlyBuckets[month] = (monthlyBuckets[month] || 0) + tx.displayAmount;
+      });
+      const sortedMonths = Object.keys(monthlyBuckets).sort();
+      return {
+        labels: sortedMonths,
+        datasets: [{
+          label: t('monthlyTrend'),
+          data: sortedMonths.map(m => monthlyBuckets[m]),
+          backgroundColor: '#3B82F6',
+          borderRadius: 6,
+        }]
+      };
+    }
+
+    // Daily trend for month-scoped filters
     const daysInMonth = 31;
     const dayData = new Array(daysInMonth).fill(0);
     filteredTransactions.forEach(tx => {
@@ -861,7 +883,7 @@ const App = () => {
                 <div className="flex items-center justify-between mb-6">
                   <div className="flex items-center gap-2">
                     <TrendingUp className="text-blue-600" size={20} />
-                    <h3 className="font-bold text-slate-800">{t('dailyTrend')}</h3>
+                    <h3 className="font-bold text-slate-800">{timeFilter === 'all' ? t('monthlyTrend') : t('dailyTrend')}</h3>
                   </div>
                   <div className="px-2 py-1 bg-blue-50 text-blue-600 text-[10px] font-black rounded uppercase">
                     {timeFilter === 'all' ? t('allTime') : (timeFilter === 'this-month' ? t('thisMonth') : selectedMonth)}
@@ -873,7 +895,7 @@ const App = () => {
                     options={{ 
                       maintainAspectRatio: false, 
                       plugins: { legend: { position: 'bottom', labels: { boxWidth: 8, usePointStyle: true, font: { size: 10, weight: 'bold' } } } },
-                      scales: { y: { beginAtZero: true, grid: { color: '#F1F5F9' } }, x: { grid: { display: false } } }
+                      scales: { y: { beginAtZero: true, grid: { color: '#F1F5F9' } }, x: { grid: { display: false }, ticks: { maxRotation: timeFilter === 'all' ? 45 : 0 } } }
                     }} 
                   />
                 </div>
