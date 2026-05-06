@@ -146,6 +146,12 @@ const saveDbToSession = (targetDb) => {
   }
 };
 
+let _saveDebounceTimer = null;
+const debouncedSaveDbToSession = (targetDb) => {
+  clearTimeout(_saveDebounceTimer);
+  _saveDebounceTimer = setTimeout(() => saveDbToSession(targetDb), 500);
+};
+
 const loadDbFromSession = (SQL) => {
   try {
     const cached = sessionStorage.getItem(SESSION_KEY);
@@ -259,7 +265,7 @@ const App = () => {
       setDb(newDb);
       setIsDbLoaded(true);
       refreshData(newDb);
-      saveDbToSession(newDb);
+      debouncedSaveDbToSession(newDb);
     };
     reader.readAsArrayBuffer(file);
   };
@@ -295,7 +301,7 @@ const App = () => {
     refreshData();
     closeModal();
     setHasUnsavedChanges(true);
-    saveDbToSession(db);
+    debouncedSaveDbToSession(db);
   };
 
   const deleteRecord = (id) => {
@@ -303,7 +309,7 @@ const App = () => {
     db.run("DELETE FROM transactions WHERE id = ?", [id]);
     refreshData();
     setHasUnsavedChanges(true);
-    saveDbToSession(db);
+    debouncedSaveDbToSession(db);
   };
 
   const startEdit = (record) => {
