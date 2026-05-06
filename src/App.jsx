@@ -217,6 +217,7 @@ const App = () => {
         }
         setDb(initialDb);
         setLibsReady(prev => ({ ...prev, sql: true }));
+        setHasUnsavedChanges(!!restoredDb);
         refreshData(initialDb);
       });
     };
