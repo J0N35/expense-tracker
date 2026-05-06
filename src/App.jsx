@@ -222,6 +222,7 @@ const App = () => {
   });
   const [rateInfo, setRateInfo] = useState({ rate: null, loading: false, error: false });
   const conversionTimerRef = useRef(null);
+  const currentCurrencyRef = useRef('HKD');
 
   // Load External Libraries via CDN
   useEffect(() => {
@@ -373,6 +374,7 @@ const App = () => {
       foreignAmount
     });
     setRateInfo({ rate: null, loading: false, error: false });
+    currentCurrencyRef.current = currency;
     setIsModalOpen(true);
   };
 
@@ -380,6 +382,7 @@ const App = () => {
     clearTimeout(conversionTimerRef.current);
     setIsModalOpen(false);
     setEditingId(null);
+    currentCurrencyRef.current = 'HKD';
     setFormData({
       amount: '',
       category: lang === 'zh' ? '餐飲' : 'Food',
@@ -393,12 +396,18 @@ const App = () => {
   };
 
   const fetchAndConvert = useCallback((currency, foreignAmt) => {
+    const parsed = parseFloat(foreignAmt);
+    if (!parsed || isNaN(parsed)) return;
     setRateInfo({ rate: null, loading: true, error: false });
     fetch(`https://api.frankfurter.app/latest?from=${currency}&to=HKD`)
       .then(r => r.json())
       .then(data => {
-        const rate = data.rates.HKD;
-        const hkd = (parseFloat(foreignAmt) * rate).toFixed(2);
+        const rate = data.rates?.HKD;
+        if (!rate) {
+          setRateInfo({ rate: null, loading: false, error: true });
+          return;
+        }
+        const hkd = (parsed * rate).toFixed(2);
         setFormData(f => ({ ...f, amount: hkd }));
         setRateInfo({ rate, loading: false, error: false });
       })
@@ -408,6 +417,7 @@ const App = () => {
   }, []);
 
   const handleCurrencyChange = (currency) => {
+    currentCurrencyRef.current = currency;
     setFormData(f => ({ ...f, currency, foreignAmount: '', amount: '' }));
     setRateInfo({ rate: null, loading: false, error: false });
     clearTimeout(conversionTimerRef.current);
@@ -417,7 +427,7 @@ const App = () => {
     setFormData(f => ({ ...f, foreignAmount: val }));
     if (val && parseFloat(val) > 0) {
       clearTimeout(conversionTimerRef.current);
-      const curr = formData.currency;
+      const curr = currentCurrencyRef.current;
       conversionTimerRef.current = setTimeout(() => fetchAndConvert(curr, val), 600);
     }
   };
@@ -728,7 +738,9 @@ const App = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-50">
-                  {filteredTransactions.map((tx) => (
+                  {filteredTransactions.map((tx) => {
+                    const tagParts = tx.tag ? tx.tag.split(':') : null;
+                    return (
                     <tr key={tx.id} className="hover:bg-slate-50/80 transition-colors group">
                       <td className="px-8 py-5 text-sm font-medium text-slate-600 font-mono">{tx.date}</td>
                       <td className="px-8 py-5">
@@ -738,11 +750,11 @@ const App = () => {
                       </td>
                       <td className="px-8 py-5 text-sm text-slate-400 italic font-medium">{tx.note || '-'}</td>
                       <td className="px-8 py-5 text-sm font-black text-right text-slate-900 whitespace-nowrap">
-                        {tx.tag ? (
+                        {tagParts && (
                           <div className="text-[10px] text-violet-500 font-bold mb-0.5">
-                            {tx.tag.split(':')[0]} {parseFloat(tx.tag.split(':')[1]).toLocaleString()}
+                            {tagParts[0]} {parseFloat(tagParts[1]).toLocaleString()}
                           </div>
-                        ) : null}
+                        )}
                         <div>
                           <span className="text-[10px] text-slate-300 mr-1 font-normal">{t('HKDE')}</span>
                           {tx.amount.toLocaleString()}
@@ -755,7 +767,8 @@ const App = () => {
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                   {filteredTransactions.length === 0 && (
                     <tr>
                       <td colSpan="5" className="px-8 py-20 text-center text-slate-300 font-medium italic">
