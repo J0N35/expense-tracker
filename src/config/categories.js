@@ -3,6 +3,10 @@ export const CATEGORY_CONFIG = [
   { id: "transport", labels: { zh: "交通", en: "Transport" } },
   { id: "shopping", labels: { zh: "購物", en: "Shopping" } },
   { id: "entertainment", labels: { zh: "娛樂", en: "Entertainment" } },
+  { id: "utilities", labels: { zh: "水電", en: "Utilities" } },
+  { id: "health", labels: { zh: "醫療", en: "Health" } },
+  { id: "education", labels: { zh: "教育", en: "Education" } },
+  { id: "travel", labels: { zh: "旅行", en: "Travel" } },
   { id: "rent", labels: { zh: "房租", en: "Rent" } },
   { id: "other", labels: { zh: "其他", en: "Other" } },
 ];
